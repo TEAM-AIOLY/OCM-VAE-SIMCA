@@ -202,6 +202,11 @@ def beta_vae_cosine_loss(x, x_recon, mu, logvar, beta=1.0, eps=1e-8):
     
     return recon_loss + beta*kl, recon_loss.detach().cpu().item(), kl.detach().cpu().item()
 
+
+def beta_vae_euclidean_loss(x, x_recon, mu, logvar, beta=1.0):
+    recon_loss = F.mse_loss(x_recon, x, reduction='mean')
+    kl = -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
+    return recon_loss + beta*kl, recon_loss.detach().cpu().item(), kl.detach().cpu().item()
 # ---------------------------
 # Load data
 # ---------------------------
@@ -277,7 +282,8 @@ param_variations = [
 ]
 
 paramsets = [{**base_params, **v} for v in param_variations]
-model_type = "VAE_class0"
+loss_type = "X_cosine"
+model_type = f"VAE_cheese_{loss_type}"
 process_id = os.path.join("Ale","cheese",model_type)
 # ---------------------------
 # Training / evaluation loop
@@ -341,7 +347,10 @@ for i,param in enumerate(paramsets):
             xb = xb[0].to(device)
             optimizer.zero_grad()
             xb_recon, mu, logvar = vae(xb)
-            loss, _, _ = beta_vae_cosine_loss(xb, xb_recon, mu, logvar)
+            if loss_type == "X_cosine":
+                    loss, _, _ = beta_vae_cosine_loss(xb, xb_recon, mu, logvar)
+            if loss_type == "X_euclidean":  
+                loss, _, _ = beta_vae_euclidean_loss(xb, xb_recon, mu, logvar)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item() * xb.size(0)
@@ -357,12 +366,11 @@ for i,param in enumerate(paramsets):
             for xb in val_loader_class0:
                 xb = xb[0].to(device)
                 xrec, mu, logvar = vae(xb)
-                val_loss += beta_vae_cosine_loss(
-                    xb,
-                    xrec,
-                    mu,
-                    logvar
-                )[0].item() * xb.size(0)
+                if loss_type == "X_cosine":
+                        loss, _, _ = beta_vae_cosine_loss(xb, xrec, mu, logvar)
+                if loss_type == "X_euclidean":  
+                    loss, _, _ = beta_vae_euclidean_loss(xb, xrec, mu, logvar)
+        val_loss += loss.item() * xb.size(0)            
         val_loss /= max(1, len(val_loader_class0.dataset))
         val_losses.append(val_loss)
         val_metrics.append(val_loss)
