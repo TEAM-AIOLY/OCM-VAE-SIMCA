@@ -189,7 +189,32 @@ class ConvVAE1D(nn.Module):
         x_rec = x_rec_std * self.spec_std + self.spec_mean
         return x_rec, mu, logvar
 
+def compute_rec_error(x: torch.Tensor, x_rec: torch.Tensor, mode: str = "euclidean") -> np.ndarray:
+    """
+    Compute per-sample reconstruction error.
 
+    Args:
+        x (torch.Tensor): Original input, shape (B, L)
+        x_rec (torch.Tensor): Reconstructed input, shape (B, L)
+        mode (str): "euclidean" or "cosine"
+
+    Returns:
+        np.ndarray: Reconstruction error per sample
+    """
+    if mode == "euclidean":
+        # standard L2 squared error per sample
+        rec_err = ((x - x_rec) ** 2).sum(dim=1).cpu().numpy()
+    elif mode == "cosine":
+        # cosine distance per sample
+        x_flat = x.view(x.size(0), -1)
+        xrec_flat = x_rec.view(x_rec.size(0), -1)
+        x_norm = F.normalize(x_flat, p=2, dim=1)
+        xrec_norm = F.normalize(xrec_flat, p=2, dim=1)
+        cos_sim = torch.sum(x_norm * xrec_norm, dim=1)
+        rec_err = torch.sqrt(2*(1 - cos_sim)).cpu().numpy()
+    else:
+        raise ValueError(f"Unknown mode {mode}, choose 'euclidean' or 'cosine'.")
+    return rec_err
 # ---------------------------
 # Cosine-based VAE loss
 def beta_vae_cosine_loss(x, x_recon, mu, logvar, beta=1.0, eps=1e-8):
@@ -200,12 +225,23 @@ def beta_vae_cosine_loss(x, x_recon, mu, logvar, beta=1.0, eps=1e-8):
     cos_theta = torch.clamp(torch.sum(x_norm * recon_norm, dim=1), -1.0 + eps, 1.0 - eps)
     recon_loss = torch.mean(torch.sqrt(2.0 * (1.0 - cos_theta)))
     kl = -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
-    
     return recon_loss + beta*kl, recon_loss.detach().cpu().item(), kl.detach().cpu().item()
-
 
 def beta_vae_euclidean_loss(x, x_recon, mu, logvar, beta=1.0):
     recon_loss = F.mse_loss(x_recon, x, reduction='mean')
+    kl = -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
+    return recon_loss + beta*kl, recon_loss.detach().cpu().item(), kl.detach().cpu().item()
+
+def beta_vae_bce_loss(x, x_recon, mu, logvar, beta=1.0, eps=1e-8):
+    # x and x_recon: raw input, same as current code
+    # scale to [0,1] per sample for BCE only
+    x_min = x.min(dim=1, keepdim=True)[0]
+    x_max = x.max(dim=1, keepdim=True)[0]
+    x_scaled = (x - x_min) / (x_max - x_min + 1e-12)
+    x_recon_scaled = (x_recon - x_min) / (x_max - x_min + 1e-12)
+    # BCE reconstruction
+    recon_loss = F.binary_cross_entropy(x_recon_scaled, x_scaled, reduction='mean')
+    # KL divergence same as before
     kl = -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
     return recon_loss + beta*kl, recon_loss.detach().cpu().item(), kl.detach().cpu().item()
 # ---------------------------
@@ -347,9 +383,11 @@ for i,param in enumerate(paramsets):
             optimizer.zero_grad()
             xb_recon, mu, logvar = vae(xb)
             if loss_type == "X_cosine":
-                loss, _, _ = beta_vae_cosine_loss(xb, xb_recon, mu, logvar)
+               loss, _, _ = beta_vae_cosine_loss(xb, xb_recon, mu, logvar)
             if loss_type == "X_euclidean":  
                 loss, _, _ = beta_vae_euclidean_loss(xb, xb_recon, mu, logvar)
+            elif loss_type == "X_bce":
+                 loss, _, _ = beta_vae_bce_loss(xb, xb_recon, mu, logvar)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item() * xb.size(0)
@@ -368,6 +406,8 @@ for i,param in enumerate(paramsets):
                     loss, _, _ = beta_vae_cosine_loss(xb, xrec, mu, logvar)
                 if loss_type == "X_euclidean":  
                     loss, _, _ = beta_vae_euclidean_loss(xb, xrec, mu, logvar)
+                elif loss_type == "X_bce":
+                    loss, _, _ = beta_vae_bce_loss(xb, xrec, mu, logvar)
         val_loss += loss.item() * xb.size(0)            
         val_loss /= max(1, len(val_loader_class0.dataset))
         val_losses.append(val_loss)

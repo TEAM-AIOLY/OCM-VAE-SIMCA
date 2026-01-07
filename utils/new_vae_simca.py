@@ -293,6 +293,7 @@ all_metrics = []
 spec_dims = X_cal.shape[1]
 
 for i,param in enumerate(paramsets):
+  if i>16:  
 
     param_id = f"Run_{i:02d}"
     print(f"running {param_id} with parameters: {param}")
