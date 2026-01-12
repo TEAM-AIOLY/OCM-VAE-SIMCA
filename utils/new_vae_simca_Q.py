@@ -408,7 +408,8 @@ for i,param in enumerate(paramsets):
                     loss, _, _ = beta_vae_euclidean_loss(xb, xrec, mu, logvar)
                 elif loss_type == "X_bce":
                     loss, _, _ = beta_vae_bce_loss(xb, xrec, mu, logvar)
-        val_loss += loss.item() * xb.size(0)            
+                val_loss += loss.item() * xb.size(0)     
+                       
         val_loss /= max(1, len(val_loader_class0.dataset))
         val_losses.append(val_loss)
         val_metrics.append(val_loss)

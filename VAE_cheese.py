@@ -277,7 +277,7 @@ param_variations = [
 ]
 
 paramsets = [{**base_params, **v} for v in param_variations]
-model_type = "VAE_class0"
+model_type = "VAE_cosine"
 process_id = os.path.join("Ale","cheese",model_type)
 # ---------------------------
 # Training / evaluation loop

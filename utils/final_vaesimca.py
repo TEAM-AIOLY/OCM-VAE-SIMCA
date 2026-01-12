@@ -10,10 +10,10 @@ import matplotlib.pyplot as plt
 import json
 from pathlib import Path
 import itertools
-from sklearn.metrics import confusion_matrix, f1_score, precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
 import torch.utils.data as data_utils
 from torch import nn, optim
+import scipy.stats
 
 # ---------------------------
 # Repro / device / root
@@ -66,6 +66,9 @@ def save_plot(fig, path: Path, filename: str, fmt="pdf", overwrite=True):
     plt.close(fig)
     return file_path
 
+# ---------------------------
+# VAE model
+# ---------------------------
 class ConvVAE1D(nn.Module):
     def __init__(
         self,
@@ -90,6 +93,7 @@ class ConvVAE1D(nn.Module):
         self.dropout = dropout
         self.use_batchnorm = use_batchnorm
         self.register_buffer("threshold", torch.tensor(0.0))
+        self.register_buffer("q_threshold", torch.tensor(0.0))
 
         act = nn.ELU if activation == "elu" else nn.GELU
         padding = kernel_size // 2
@@ -157,7 +161,7 @@ class ConvVAE1D(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
     def encode(self, x):
-        x = x.unsqueeze(1)  # (B,1,L)
+        x = x.unsqueeze(1)
         h = self.encoder_conv(x)
         h = h.view(h.size(0), -1)
         h = self.fc(h)
@@ -188,9 +192,9 @@ class ConvVAE1D(nn.Module):
         x_rec = x_rec_std * self.spec_std + self.spec_mean
         return x_rec, mu, logvar
 
-
 # ---------------------------
-# Cosine-based VAE loss
+# Losses
+# ---------------------------
 def beta_vae_cosine_loss(x, x_recon, mu, logvar, beta=1.0, eps=1e-8):
     x_flat = x.view(x.size(0), -1)
     x_recon_flat = x_recon.view(x_recon.size(0), -1)
@@ -199,14 +203,27 @@ def beta_vae_cosine_loss(x, x_recon, mu, logvar, beta=1.0, eps=1e-8):
     cos_theta = torch.clamp(torch.sum(x_norm * recon_norm, dim=1), -1.0 + eps, 1.0 - eps)
     recon_loss = torch.mean(torch.sqrt(2.0 * (1.0 - cos_theta)))
     kl = -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
-    
     return recon_loss + beta*kl, recon_loss.detach().cpu().item(), kl.detach().cpu().item()
-
 
 def beta_vae_euclidean_loss(x, x_recon, mu, logvar, beta=1.0):
     recon_loss = F.mse_loss(x_recon, x, reduction='mean')
     kl = -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
     return recon_loss + beta*kl, recon_loss.detach().cpu().item(), kl.detach().cpu().item()
+
+def beta_vae_bce_loss(x, x_recon, mu, logvar, beta=1.0, eps=1e-8):
+    # Per-sample min/max scaling
+    x_min = x.min(dim=1, keepdim=True)[0]
+    x_max = x.max(dim=1, keepdim=True)[0]
+    # Scale to [0,1] and clamp to strictly enforce BCE bounds
+    x_scaled = ((x - x_min) / (x_max - x_min + eps)).clamp(0.0, 1.0)
+    x_recon_scaled = ((x_recon - x_min) / (x_max - x_min + eps)).clamp(0.0, 1.0)
+    # BCE reconstruction loss
+    recon_loss = F.binary_cross_entropy(x_recon_scaled, x_scaled, reduction='mean')
+    # KL divergence
+    kl = -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
+    return recon_loss + beta*kl, recon_loss.detach().cpu().item(), kl.detach().cpu().item()
+
+
 # ---------------------------
 # Load data
 # ---------------------------
@@ -253,18 +270,18 @@ base_params = {
     "std": None,
     "DP" : 0.2,
     "LR": 0.001,
-    "EPOCH": 3000,
+    "EPOCH": 200,
     "WD": 0.003/2,
     "batch_size" : 512
 }
 
 LATENT_DIMS = [21,30]
-HIDDEN_DIMS = [64,128,256]
-LRS = [0.0001]
+HIDDEN_DIMS = [64,128]
+LRS = [0.00001]
 CONV_BLOCKS = [1,2]
 N_FILTERS   = [1,3]
-KERNELS     = [3,5]
-DP=[0.1,0.2]
+KERNELS     = [3,5,9]
+DP=[0.1]
 
 param_variations = [
     {
@@ -282,12 +299,12 @@ param_variations = [
 ]
 
 paramsets = [{**base_params, **v} for v in param_variations]
-loss_type = "X_euclidean"  # or "X_cosine"
-model_type = f"VAE_cheese_{loss_type}"
+loss_type = "X_cosine"  # options: X_cosine, X_euclidean, X_bce
+model_type = f"final_VAE_cheese_{loss_type}"
 process_id = os.path.join("Ale","cheese",model_type)
+
 # ---------------------------
 # Training / evaluation loop
-# ---------------------------
 all_params = []
 all_metrics = []
 spec_dims = X_cal.shape[1]
@@ -340,7 +357,6 @@ for i,param in enumerate(paramsets):
     for epoch in range(int(param["EPOCH"])):
         # ---------------------------
         # Training
-        # ---------------------------
         vae.train()
         epoch_loss = 0.0
         for xb in cal_loader_class0:
@@ -348,9 +364,11 @@ for i,param in enumerate(paramsets):
             optimizer.zero_grad()
             xb_recon, mu, logvar = vae(xb)
             if loss_type == "X_cosine":
-                    loss, _, _ = beta_vae_cosine_loss(xb, xb_recon, mu, logvar)
+               loss, _, _ = beta_vae_cosine_loss(xb, xb_recon, mu, logvar)
             if loss_type == "X_euclidean":  
                 loss, _, _ = beta_vae_euclidean_loss(xb, xb_recon, mu, logvar)
+            elif loss_type == "X_bce":
+                 loss, _, _ = beta_vae_bce_loss(xb, xb_recon, mu, logvar)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item() * xb.size(0)
@@ -359,7 +377,6 @@ for i,param in enumerate(paramsets):
 
         # ---------------------------
         # Validation
-        # ---------------------------
         vae.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -367,20 +384,21 @@ for i,param in enumerate(paramsets):
                 xb = xb[0].to(device)
                 xrec, mu, logvar = vae(xb)
                 if loss_type == "X_cosine":
-                        loss, _, _ = beta_vae_cosine_loss(xb, xrec, mu, logvar)
+                    loss, _, _ = beta_vae_cosine_loss(xb, xrec, mu, logvar)
                 if loss_type == "X_euclidean":  
                     loss, _, _ = beta_vae_euclidean_loss(xb, xrec, mu, logvar)
-        val_loss += loss.item() * xb.size(0)            
+                elif loss_type == "X_bce":
+                    loss, _, _ = beta_vae_bce_loss(xb, xrec, mu, logvar)
+                val_loss += loss.item() * xb.size(0)     
         val_loss /= max(1, len(val_loader_class0.dataset))
         val_losses.append(val_loss)
         val_metrics.append(val_loss)
 
-        if (epoch+1) % 50 == 0 or epoch == 0:
+        if (epoch+1) % 2 == 0 or epoch == 0:
             print(f"Epoch {epoch+1}/{param['EPOCH']} | Train: {epoch_loss:.6f} | Val: {val_loss:.6f}")
 
         # ---------------------------
         # Save best model automatically
-        # ---------------------------
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_epoch = epoch
@@ -388,12 +406,25 @@ for i,param in enumerate(paramsets):
             # ----- Compute latent stats on calibration set
             vae.eval()
             mus_train_list = []
+            rec_errors_list = []  # <-- Q errors
             with torch.no_grad():
                 for xb in cal_loader_class0:
                     x = xb[0].to(device)
                     x_std = (x - vae.spec_mean) / vae.spec_std
                     mu_t, _ = vae.encode(x_std)
                     mus_train_list.append(mu_t.cpu().numpy())
+                    x_rec, _, _ = vae(x)
+                    if loss_type == "X_bce":
+                        # Per-sample min/max normalization (consistent with BCE loss)
+                        x_min = x.min(dim=1, keepdim=True)[0]
+                        x_max = x.max(dim=1, keepdim=True)[0]
+                        x_scaled = ((x - x_min) / (x_max - x_min + 1e-8)).clamp(0.0, 1.0)
+                        x_rec_scaled = ((x_rec - x_min) / (x_max - x_min + 1e-8)).clamp(0.0, 1.0)
+                        rec_err = ((x_scaled - x_rec_scaled)**2).sum(dim=1).cpu().numpy()
+                    else:
+                        rec_err = ((x - x_rec)**2).sum(dim=1).cpu().numpy()  # unbounded
+
+                    rec_errors_list.append(rec_err)
             mus_train = np.concatenate(mus_train_list, axis=0)
             mu_train_mean = np.mean(mus_train, axis=0)
             cov = np.cov(mus_train, rowvar=False) + np.eye(mus_train.shape[1]) * 1e-6
@@ -402,23 +433,23 @@ for i,param in enumerate(paramsets):
             except np.linalg.LinAlgError:
                 cov_inv = np.linalg.pinv(cov)
             threshold = float(np.percentile(np.einsum('ij,jk,ik->i', mus_train - mu_train_mean, cov_inv, mus_train - mu_train_mean), 95))
+            q_threshold = float(np.percentile(np.concatenate(rec_errors_list), 95))  # <-- Q threshold 95%
 
             # ----- Save latent stats inside model
             vae.latent_mean.copy_(torch.tensor(mu_train_mean, dtype=torch.float32))
             vae.latent_cov_inv.copy_(torch.tensor(cov_inv, dtype=torch.float32))
             vae.threshold.copy_(torch.tensor(threshold, dtype=torch.float32))
+            vae.q_threshold.copy_(torch.tensor(q_threshold, dtype=torch.float32))  # <-- store Q
 
             # ----- Save best model with updated stats
             save_model(vae, Path(base_path), "VAE_class0_best.pth")
-        # ---------------------------
-        # Save final loss history
-        # ---------------------------
+
+    # ---------------------------
+    # Save final loss history
     save_metrics({"train_losses": train_losses, "val_losses": val_losses}, Path(base_path), "losses.json")
 
-
-        # ---------------------------
-    # Load best model for evaluation
     # ---------------------------
+    # Load best model for evaluation
     vae_best = ConvVAE1D(
         input_length=spec_dims,
         latent_dim=param["latent_dim"],
@@ -437,8 +468,8 @@ for i,param in enumerate(paramsets):
 
     # ---------------------------
     # Benchmark on test set
-    # ---------------------------
     test_d2_list = []
+    test_q_list = []  # <-- Q list
     labels_true_list = []
     with torch.no_grad():
         for xb, yb in test_loader:
@@ -449,67 +480,113 @@ for i,param in enumerate(paramsets):
             diff = mu_np - vae_best.latent_mean.cpu().numpy()[None, :]
             d2 = np.einsum('ij,jk,ik->i', diff, vae_best.latent_cov_inv.cpu().numpy(), diff)
             test_d2_list.append(d2)
+            x_rec, _, _ = vae_best(x)
+            if loss_type == "X_bce":
+                # Per-sample min/max normalization (consistent with BCE loss)
+                x_min = x.min(dim=1, keepdim=True)[0]
+                x_max = x.max(dim=1, keepdim=True)[0]
+                x_scaled = ((x - x_min) / (x_max - x_min + 1e-8)).clamp(0.0, 1.0)
+                x_rec_scaled = ((x_rec - x_min) / (x_max - x_min + 1e-8)).clamp(0.0, 1.0)
+                q = ((x_scaled - x_rec_scaled)**2).sum(dim=1).cpu().numpy()
+            else:
+                q = ((x - x_rec)**2).sum(dim=1).cpu().numpy()
+            test_q_list.append(q)
             labels_true_list.append(np.argmax(yb.numpy(), axis=1))
     recon_errors = np.concatenate(test_d2_list)
+    q_errors = np.concatenate(test_q_list)  # <-- Q
     labels_true = np.concatenate(labels_true_list)
 
-    pred_class0 = recon_errors <= vae_best.threshold.item()
+    # ---------------------------
+    # FULL DISTANCE DECISION LOGIC
+    mus_test_list = []
+    with torch.no_grad():
+        for xb, _ in test_loader:
+            x = xb.to(device)
+            x_std = (x - vae_best.spec_mean) / vae_best.spec_std
+            mu_t, _ = vae_best.encode(x_std)
+            mus_test_list.append(mu_t.cpu().numpy())
+    mus_test = np.concatenate(mus_test_list, axis=0)
+
+    # h: explained distance
+    Z_prime = (mus_test - vae_best.latent_mean.cpu().numpy())
+    h = np.sum(Z_prime**2, axis=1)
+    h0 = np.mean(h)
+    sh = np.std(h)
+    Nh = 2 * (h0 / sh)**2
+    h_scaled = h / h0 * Nh
+
+    # q: residual distance
+    q = q_errors
+    q0 = np.mean(q)
+    sq = np.std(q)
+    Nq = 2 * (q0 / sq)**2
+    q_scaled = q / q0 * Nq
+
+    # full distance f
+    f = h_scaled + q_scaled
+    Nf = Nh + Nq
+    alpha = 0.05
+    fcrit = sp.stats.chi2.ppf(1-alpha, Nf)
+
+    # prediction
+    pred_class0 = f <= fcrit
     pred_labels = np.where(pred_class0, 0, 1)
 
+    # ---------------------------
+    # Confusion matrix
     unique_true = np.unique(labels_true)
     n_true = len(unique_true)
     conf_mat_full = np.zeros((2, n_true), dtype=int)
-
-    for i, pred in enumerate([0, 1]):  # 0=conform, 1=unconform
+    for i, pred in enumerate([0, 1]):
         for j, true_class in enumerate(unique_true):
             conf_mat_full[i, j] = np.sum((pred_labels == pred) & (labels_true == true_class))
 
-
-    # Plot as before
+    # Plot confusion
     fig, ax = plt.subplots(figsize=(6,4))
     sns.heatmap(conf_mat_full, annot=True, fmt="d", cmap="Blues", cbar=False,
                 xticklabels=[f"class{c+1}" for c in unique_true], yticklabels=["conform","unconform"], ax=ax)
     ax.set_xlabel("True class")
     ax.set_ylabel("Predicted")
     plt.tight_layout()
-    save_plot(fig, Path(base_path), "confusion_matrix_anomaly", fmt="pdf")
+    save_plot(fig, Path(base_path), "confusion_matrix", fmt="pdf")   
 
-    # --- Metrics
-    TP = conf_mat_full[0, 0]          # conform correctly predicted
-    FN = conf_mat_full[1, 0]          # conform rejected
-    FP = conf_mat_full[0, 1:].sum()   # anomalies accepted as conform
-    TN = conf_mat_full[1, 1:].sum()   # anomalies correctly rejected
+    # ---------------------------
+    # Metrics
+    TP = conf_mat_full[0, 0]
+    FN = conf_mat_full[1, 0]
+    FP = conf_mat_full[0, 1:].sum()
+    TN = conf_mat_full[1, 1:].sum()
 
-    # binary metrics (conform=positive)
     accuracy = (TP + TN) / (TP + TN + FP + FN + 1e-12)
     precision = TP / (TP + FP + 1e-12)
     recall = TP / (TP + FN + 1e-12)
     f1 = 2 * precision * recall / (precision + recall + 1e-12)
 
-    # per-anomaly-class false acceptance rate
     fa_rates = conf_mat_full[0, 1:] / (conf_mat_full[:, 1:].sum(axis=0) + 1e-12)
     fa_mean = np.mean(fa_rates)
 
     metrics_dict = {
-    'num_epochs': int(param['EPOCH']),
-    'batch_size': int(param['batch_size']),
-    'LR': float(param['LR']),
-    'WD': float(param['WD']),
-    'latent_dim': int(param['latent_dim']),
-    'hidden_dim': int(param['hidden_dim']),
-    'conv_blocks': int(param['conv_blocks']),
-    'n_filters': int(param['n_filters']),
-    'kernel_size': int(param['kernel_size']),
-    'F1': float(f1),
-    'accuracy': float(accuracy),
-    'precision': float(precision),
-    'recall': float(recall),
-    'mean_false_acceptance': float(fa_mean),
-    'false_acceptance_per_class': fa_rates.tolist(),
-    'N_parameters': int(nb_train_params),
-    'model_name': model_type,
-    'Run_ID': param_id,
-    'best_epoch': int(best_epoch)
+        'num_epochs': int(param['EPOCH']),
+        'batch_size': int(param['batch_size']),
+        'LR': float(param['LR']),
+        'WD': float(param['WD']),
+        'latent_dim': int(param['latent_dim']),
+        'hidden_dim': int(param['hidden_dim']),
+        'conv_blocks': int(param['conv_blocks']),
+        'n_filters': int(param['n_filters']),
+        'kernel_size': int(param['kernel_size']),
+        'F1': float(f1),
+        'accuracy': float(accuracy),
+        'precision': float(precision),
+        'recall': float(recall),
+        'mean_false_acceptance': float(fa_mean),
+        'false_acceptance_per_class': fa_rates.tolist(),
+        'N_parameters': int(nb_train_params),
+        'model_name': model_type,
+        'Run_ID': param_id,
+        'best_epoch': int(best_epoch),
+        'Q_threshold': float(vae_best.q_threshold.item()),
+        'full_distance_threshold': float(fcrit)
     }
     all_metrics.append(metrics_dict)
 
@@ -520,6 +597,7 @@ for i,param in enumerate(paramsets):
 # ---------------------------
 # Save all params & metrics summary
 summary_dir = os.path.join(root,process_id)
+os.makedirs(summary_dir, exist_ok=True)
 with open(os.path.join(summary_dir,"all_params.json"),"w") as f:
     json.dump(all_params,f,indent=2)
 with open(os.path.join(summary_dir,"all_metrics.json"),"w") as f:
