@@ -1,6 +1,7 @@
 import torch
 from torch import nn
-import numpy as np
+from scipy.stats import chi2
+import torch.nn.functional as F
 
 class ConvVAE1D(nn.Module):
     def __init__(
@@ -26,6 +27,9 @@ class ConvVAE1D(nn.Module):
         self.dropout = dropout
         self.use_batchnorm = use_batchnorm
         self.register_buffer("threshold", torch.tensor(0.0))
+        self.register_buffer("threshold_q", torch.tensor(0.0))
+        self.register_buffer("threshold_h", torch.tensor(0.0))
+        self.register_buffer("threshold_f", torch.tensor(0.0))
 
         act = nn.ELU if activation == "elu" else nn.GELU
         padding = kernel_size // 2
@@ -123,3 +127,56 @@ class ConvVAE1D(nn.Module):
         x_rec_std = self.decode(z)
         x_rec = x_rec_std * self.spec_std + self.spec_mean
         return x_rec, mu, logvar
+
+
+# ===========================
+# Loss functions
+# ===========================
+
+def beta_vae_cosine_loss(x, x_recon, mu, logvar, beta=1.0, eps=1e-8):
+    x_flat = x.view(x.size(0), -1)
+    x_recon_flat = x_recon.view(x_recon.size(0), -1)
+    x_norm = F.normalize(x_flat, p=2, dim=1)
+    recon_norm = F.normalize(x_recon_flat, p=2, dim=1)
+    cos_theta = torch.clamp(torch.sum(x_norm * recon_norm, dim=1), -1.0 + eps, 1.0 - eps)
+    recon_loss = torch.mean(torch.sqrt(2.0 * (1.0 - cos_theta)))
+    kl = -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
+    
+    return recon_loss + beta*kl, recon_loss.detach().cpu().item(), kl.detach().cpu().item()
+
+
+def beta_vae_bce_loss(x, x_recon, mu, logvar, beta=1.0, eps=1e-8):
+    x_min = x.min(dim=1, keepdim=True)[0]
+    x_max = x.max(dim=1, keepdim=True)[0]
+    x_scaled = ((x - x_min) / (x_max - x_min + eps)).clamp(0.0, 1.0)
+
+    x_flat = x_scaled.view(x_scaled.size(0), -1)
+    x_recon_flat = x_recon.view(x_recon.size(0), -1)
+
+    recon_loss = F.binary_cross_entropy_with_logits(x_recon_flat, x_flat, reduction='mean')
+    kl = -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
+    return recon_loss + beta*kl, recon_loss.detach().cpu().item(), kl.detach().cpu().item()
+
+# ---------------------------
+# Chi-square distance computation
+def compute_q_h_f(x, x_rec, z):
+    # q = squared reconstruction residual
+    q = torch.sum((x - x_rec)**2, dim=1)
+    q0, sq = q.mean().item(), q.std(unbiased=True).item()
+    Nq = 2 * (q0 / sq)**2
+    q_crit = chi2.ppf(0.95, df=Nq)
+
+    # h = squared Mahalanobis via SVD of standardized latent
+    z_std = (z - z.mean(dim=0)) / (z.std(dim=0) + 1e-12)
+    U, S, Vt = torch.linalg.svd(z_std, full_matrices=False)
+    h = torch.sum(U**2, dim=1)
+    h0, sh = h.mean().item(), h.std(unbiased=True).item()
+    Nh = 2 * (h0 / sh)**2
+    h_crit = chi2.ppf(0.95, df=Nh)
+
+    # full distance
+    f = (h / h0) * Nh + (q / q0) * Nq
+    Nf = Nh + Nq
+    f_crit = chi2.ppf(0.95, df=Nf)
+
+    return q, h, f, q_crit, h_crit, f_crit
