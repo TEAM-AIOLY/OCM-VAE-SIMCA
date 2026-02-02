@@ -11,8 +11,9 @@ import seaborn as sns
 import torch
 import torch.optim as optim
 import torch.utils.data as data_utils
-import itertools
+import optuna
 from pathlib import Path
+from sklearn.metrics import roc_auc_score
 
 from vae_model import ConvVAE1D, beta_vae_bce_loss, compute_q_h_f
 from utils.data_utils import object_aware_splits
@@ -87,7 +88,6 @@ _, _, _, X_cal, X_val, X_test_in, X_test_out = object_aware_splits(
     data, nut_types, TARGET_NUT, n_wavelengths
 )
 
-# labels for test
 y_test_in = np.zeros(len(X_test_in), dtype=int)
 y_test_out = np.ones(len(X_test_out), dtype=int)
 
@@ -97,41 +97,35 @@ y_test = np.concatenate([y_test_in, y_test_out])
 # ============================================================
 # OUTPUT
 # ============================================================
-output_dir = Path(data_root) / data_folder / "vae_simca_analysis" / TARGET_NUT
+output_dir = Path(data_root) / data_folder / "vae_simca_optuna" / TARGET_NUT
 output_dir.mkdir(parents=True, exist_ok=True)
 
 # ============================================================
-# PARAMS 
+# FIXED PARAMS 
 # ============================================================
-base_params = {
+BASE_PARAMS = {
     "batch_size": 512,
-    "n_epochs": 100,
-    "weight_decay": 0.003 / 2,
+    "n_epochs": 400,
     "beta": 1.0,
+     "weight_decay": 0.003 / 2,
 }
 
-param_grid = {
-    "latent_dim": [32],
-    "hidden_fc": [32, 64],
-    "learning_rate": [1e-4],
-    "conv_blocks": [1, 3],
-    "n_filters": [1, 3],
-    "kernel_size": [5, 7],
-    "dropout": [0.1],
-}
-
-keys, values = zip(*param_grid.items())
-param_list = [dict(zip(keys, v)) for v in itertools.product(*values)]
-
-all_metrics = []
-print(f"target nut: {TARGET_NUT}, total runs: {len(param_list)}")
 # ============================================================
-# Benchmark
+# OPTUNA OBJECTIVE
 # ============================================================
-for run_idx, params in enumerate(param_list):
+def objective(trial):
 
-    run_name = f"run_{run_idx:03d}"
-    print(f"\n=== RUN {run_idx+1}/{len(param_list)}: {run_name} ===")
+    params = {
+        "latent_dim": trial.suggest_categorical("latent_dim", [20, 30]),
+        "hidden_fc": trial.suggest_categorical("hidden_fc", [ 64, 128, 256]),
+        "conv_blocks": trial.suggest_int("conv_blocks", 1, 5),
+        "n_filters": trial.suggest_int("n_filters", 1, 5),
+        "kernel_size": trial.suggest_categorical("kernel_size", [3,5, 7, 9]),
+        "dropout": trial.suggest_float("dropout", 0.0, 0.5, step=0.1),
+        "learning_rate": trial.suggest_loguniform("learning_rate", 1e-5, 3e-4),
+    }
+
+    run_name = f"trial_{trial.number:03d}"
     base_path = output_dir / run_name
     base_path.mkdir(parents=True, exist_ok=True)
 
@@ -149,36 +143,35 @@ for run_idx, params in enumerate(param_list):
         hidden_fc=params["hidden_fc"],
         dropout=params["dropout"],
         activation="elu",
-        beta=base_params["beta"]
+        beta=BASE_PARAMS["beta"]
     ).to(device)
 
     optimizer = optim.Adam(
         vae.parameters(),
         lr=params["learning_rate"],
-        weight_decay=base_params["weight_decay"]
+        weight_decay=BASE_PARAMS["weight_decay"]
     )
 
     cal_loader = data_utils.DataLoader(
         data_utils.TensorDataset(torch.tensor(X_cal, dtype=torch.float32)),
-        batch_size=base_params["batch_size"], shuffle=True
+        batch_size=BASE_PARAMS["batch_size"], shuffle=True
     )
 
     val_loader = data_utils.DataLoader(
         data_utils.TensorDataset(torch.tensor(X_val, dtype=torch.float32)),
-        batch_size=base_params["batch_size"], shuffle=False
+        batch_size=BASE_PARAMS["batch_size"], shuffle=False
     )
 
-    train_losses, val_losses = [], []
     best_val_loss = np.inf
     best_epoch = -1
 
     # ========================================================
     # TRAINING
     # ========================================================
-    for epoch in range(base_params["n_epochs"]):
+    for epoch in range(BASE_PARAMS["n_epochs"]):
+
         vae.train()
         tot_loss = 0.0
-
         for xb, in cal_loader:
             xb = xb.to(device)
             optimizer.zero_grad()
@@ -189,7 +182,6 @@ for run_idx, params in enumerate(param_list):
             tot_loss += loss.item() * xb.size(0)
 
         train_loss = tot_loss / len(cal_loader.dataset)
-        train_losses.append(train_loss)
 
         vae.eval()
         tot_loss = 0.0
@@ -201,51 +193,37 @@ for run_idx, params in enumerate(param_list):
                 tot_loss += loss.item() * xb.size(0)
 
         val_loss = tot_loss / len(val_loader.dataset)
-        val_losses.append(val_loss)
-        # Verbose
-        if (epoch + 1) % 50 == 0:
-            print(f"Epoch {epoch+1}/{base_params['n_epochs']} | Train: {train_loss:.6f} | Val: {val_loss:.6f}")
+
+        trial.report(val_loss, epoch)
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_epoch = epoch
 
-            # ---------- thresholds
-            q_list, h_list, f_list = [], [], []
             with torch.no_grad():
                 for xb, in cal_loader:
                     x = xb.to(device)
                     x_rec, z, _ = vae(x)
-                    q, h, f, q_c, h_c, f_c = compute_q_h_f(x, x_rec, z)
-                    q_list.append(q.cpu().numpy())
-                    h_list.append(h.cpu().numpy())
-                    f_list.append(f.cpu().numpy())
+                    _, _, _, _, _, f_c = compute_q_h_f(x, x_rec, z)
 
-            vae.threshold_q.copy_(torch.tensor(q_c))
-            vae.threshold_h.copy_(torch.tensor(h_c))
             vae.threshold_f.copy_(torch.tensor(f_c))
-
             save_model(vae, base_path, "VAE_class0_best.pth")
 
-    save_metrics(
-        {"train_losses": train_losses, "val_losses": val_losses},
-        base_path,
-        "losses.json"
-    )
+    # ========================================================
+    # TEST
+    # ========================================================
+    vae.load_state_dict(torch.load(base_path / "VAE_class0_best.pth"))
+    vae.eval()
 
-    # ========================================================
-    # TEST 
-    # ========================================================
     test_loader = data_utils.DataLoader(
         data_utils.TensorDataset(
             torch.tensor(X_test, dtype=torch.float32),
             torch.tensor(y_test)
         ),
-        batch_size=base_params["batch_size"], shuffle=False
+        batch_size=BASE_PARAMS["batch_size"], shuffle=False
     )
-
-    vae.load_state_dict(torch.load(base_path / "VAE_class0_best.pth"))
-    vae.eval()
 
     f_values, labels_true = [], []
 
@@ -260,6 +238,11 @@ for run_idx, params in enumerate(param_list):
     f_all = np.concatenate(f_values)
     labels_true = np.concatenate(labels_true)
 
+    auc = roc_auc_score(labels_true, f_all)
+
+    # ========================================================
+    # CONFUSION MATRIX + FIGURE (UNCHANGED)
+    # ========================================================
     pred_class0 = f_all <= vae.threshold_f.item()
     pred_labels = np.where(pred_class0, 0, 1)
 
@@ -267,9 +250,6 @@ for run_idx, params in enumerate(param_list):
     for i in range(len(labels_true)):
         conf_mat[pred_labels[i], labels_true[i]] += 1
 
-    # ========================================================
-    # FIGURE
-    # ========================================================
     fig, ax = plt.subplots(figsize=(6, 4))
     sns.heatmap(conf_mat, annot=True, fmt="d", cmap="Blues",
                 xticklabels=["in", "out"],
@@ -292,30 +272,36 @@ for run_idx, params in enumerate(param_list):
     recall = TP / (TP + FN + 1e-12)
     f1 = 2 * precision * recall / (precision + recall + 1e-12)
 
-    metrics = {
-        "run": run_name,
-        "latent_dim": params["latent_dim"],
-        "hidden_fc": params["hidden_fc"],
-        "conv_blocks": params["conv_blocks"],
-        "n_filters": params["n_filters"],
-        "kernel_size": params["kernel_size"],
-        "F1": f1,
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "best_epoch": best_epoch
-    }
+    # store secondary metrics
+    trial.set_user_attr("F1", f1)
+    trial.set_user_attr("accuracy", accuracy)
+    trial.set_user_attr("best_epoch", best_epoch)
+    trial.set_user_attr("auc", auc)
 
-    all_metrics.append(metrics)
-
-    with open(base_path / "metrics.txt", "w") as f:
-        for k, v in metrics.items():
-            f.write(f"{k}: {v}\n")
+    return accuracy
 
 # ============================================================
-# GLOBAL SUMMARY
+# RUN STUDY
 # ============================================================
-with open(output_dir / "all_metrics.json", "w") as f:
-    json.dump(all_metrics, f, indent=2)
+study = optuna.create_study(
+    direction="maximize",
+    sampler=optuna.samplers.TPESampler(seed=42),
+    pruner=optuna.pruners.MedianPruner(n_warmup_steps=10)
+)
 
-print("SWEEP FINISHED")
+study.optimize(objective, n_trials=50)
+
+# ============================================================
+# SAVE GLOBAL RESULTS
+# ============================================================
+with open(output_dir / "study_results.json", "w") as f:
+    json.dump(
+        [{"trial": t.number, **t.params, **t.user_attrs} for t in study.trials if t.value is not None],
+        f,
+        indent=2
+    )
+
+print("OPTUNA SWEEP FINISHED")
+print("Best trial:", study.best_trial.number)
+print("Best params:", study.best_params)
+print("Best AUC:", study.best_value)

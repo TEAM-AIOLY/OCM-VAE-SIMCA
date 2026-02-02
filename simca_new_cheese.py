@@ -62,7 +62,7 @@ print( conf_mat_full)
 # # Plot as before
 fig, ax = plt.subplots(figsize=(6,4))
 sns.heatmap(conf_mat_full, annot=True, fmt="d", cmap="Blues", cbar=False,
-            xticklabels=[f"class{c+1}" for c in unique_true], yticklabels=["conform","unconform"], ax=ax)
+            xticklabels=[f"class{c}" for c in unique_true], yticklabels=["conform","unconform"], ax=ax)
 ax.set_xlabel("True class")
 ax.set_ylabel("Predicted class")
 plt.tight_layout()

@@ -61,7 +61,7 @@ print(f"Target nut type: {TARGET_NUT}\n")
 
 print(f"Processing {TARGET_NUT}:")
 
-# Build cleaned per-nut arrays, detect outliers using preprocessed copy, then split raw cleaned spectra 70/15/15
+#
 splits = {}
 for nut_type in nut_types:
     # Stack raw spectra for this nut
@@ -101,14 +101,8 @@ for nut_type in nut_types:
     else:
         print(f"  {nut_type}: too few samples for PCA-outlier removal, skipping outlier removal")
 
-    # Now split the cleaned RAW spectra (X_clean) into cal/val/test (70/15/15)
-    if X_clean.shape[0] < 3:
-        X_cal_nut = X_clean
-        X_val_nut = np.empty((0, X_clean.shape[1]), dtype=X_clean.dtype)
-        X_test_nut = np.empty((0, X_clean.shape[1]), dtype=X_clean.dtype)
-    else:
-        X_cal_nut, X_temp_nut = train_test_split(X_clean, test_size=0.3, random_state=42)
-        X_val_nut, X_test_nut = train_test_split(X_temp_nut, test_size=0.5, random_state=42)
+    X_cal_nut, X_temp_nut = train_test_split(X_clean, test_size=0.3, random_state=42)
+    X_val_nut, X_test_nut = train_test_split(X_temp_nut, test_size=0.5, random_state=42)
 
     splits[nut_type] = {'cal': X_cal_nut, 'val': X_val_nut, 'test': X_test_nut}
     print(f"  {nut_type}: raw samples after cleaning={X_clean.shape[0]} -> cal={X_cal_nut.shape}, val={X_val_nut.shape}, test={X_test_nut.shape}")
